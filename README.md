@@ -31,7 +31,7 @@ A Python-based tool for automatically extracting and processing data from Course
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/CAFautomation.git
+   git clone https://github.com/shanalishah/CAFautomation.git
    cd CAFautomation
    ```
 
@@ -171,7 +171,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 👥 Authors
 
-- **Your Name** - *Initial work* - [YourGitHub](https://github.com/yourusername)
+- **Shanali Shah** - *Initial work* - [shanalishah](https://github.com/shanalishah)
 
 ## 🙏 Acknowledgments
 
