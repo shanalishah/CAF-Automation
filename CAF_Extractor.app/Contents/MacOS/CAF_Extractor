@@ -1,0 +1,30 @@
+#!/bin/bash
+
+echo "Starting CAF Extractor..."
+echo "The application will open in your web browser."
+echo "Close this window to stop the application."
+echo "----------------------------------------"
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Go up to the project directory (Contents/MacOS -> Contents -> app -> project)
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+cd "$PROJECT_DIR"
+
+# Check if caf.py exists
+if [ ! -f "caf.py" ]; then
+    echo "Error: caf.py not found in the project directory."
+    echo "Looking for: $PROJECT_DIR/caf.py"
+    osascript -e 'display dialog "Error: caf.py not found in the project directory." buttons {"OK"} default button "OK"'
+    exit 1
+fi
+
+# Run streamlit
+python3 -m streamlit run caf.py --server.headless false --server.port 8501
+
+echo "Application stopped."
+
+
+
+
+
