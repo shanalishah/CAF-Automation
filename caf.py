@@ -11,6 +11,12 @@ import fitz  # PyMuPDF
 from pdf2image import convert_from_bytes
 import pytesseract
 import numpy as np
+
+# Configure pytesseract for Streamlit Cloud
+try:
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+except:
+    pass  # Use default path if not found
 from PIL import Image
 
 st.set_page_config(page_title="CAF Extractor (Robust)", layout="wide")
