@@ -56,6 +56,10 @@ A Python-based tool for automatically extracting and processing data from Course
    sudo apt-get install tesseract-ocr
    ```
 
+## 🌐 Live Demo
+
+**Try the application online:** [CAF Extractor on Streamlit Cloud](https://caf-automation.streamlit.app/)
+
 ## 🚀 Usage
 
 ### Method 1: Streamlit Web Interface (Recommended)
@@ -156,6 +160,33 @@ The tool automatically detects:
 ### Debug Mode
 
 The application includes debug information in an expandable section to help troubleshoot extraction issues.
+
+## ☁️ Deployment
+
+### Streamlit Cloud Deployment
+
+This application is deployed on Streamlit Cloud for easy access:
+
+1. **Visit the live app**: [CAF Extractor on Streamlit Cloud](https://caf-automation.streamlit.app/)
+2. **Upload your CAF PDF** directly in the browser
+3. **Download results** as CSV
+
+### Deploy Your Own Version
+
+To deploy your own version on Streamlit Cloud:
+
+1. **Fork this repository** on GitHub
+2. **Go to [share.streamlit.io](https://share.streamlit.io)**
+3. **Connect your GitHub account**
+4. **Select your forked repository**
+5. **Set the main file path** to `caf.py`
+6. **Click "Deploy!"**
+
+The deployment includes:
+- ✅ Automatic dependency installation
+- ✅ Tesseract OCR support
+- ✅ File upload and processing
+- ✅ CSV download functionality
 
 ## 🤝 Contributing
 
