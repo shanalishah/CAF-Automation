@@ -742,7 +742,7 @@ def nearest_by_y(target_y: float, items: List[Dict[str, Any]], page: int, y_tol:
         return best
     return None
 
-def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, page: int, y_tolerance: float = 20.0) -> Dict[str, str]:
+def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, page: int, y_tolerance: float = 30.0) -> Dict[str, str]:
     """
     Extract approval data from text blocks near a course line.
     This handles forms where approval data is handwritten rather than in form fields.
@@ -769,6 +769,10 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
         if any(term in text.lower() for term in ["rohan", "palma", "rp", "general elective", "elective only", "erin smith"]):
             approval_data["elective"] = text
             
+        # Also check for "Erin Smith" in elective context
+        if "erin smith" in text.lower() and any(term in text.lower() for term in ["elective", "general elective"]):
+            approval_data["elective"] = text
+            
         # Check for major/minor approval patterns with handwritten signatures
         # Look for patterns like "INTR: PPD", "INTR: GoN; PaC", or handwritten names
         # But exclude elective-specific terms
@@ -776,15 +780,26 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
             not any(term in text.lower() for term in ["elective", "general elective", "elective only"])):
             approval_data["major_minor"] = text
             
+        # Also check for "Erin Smith" in major/minor context (not in elective context)
+        if ("erin smith" in text.lower() and 
+            not any(term in text.lower() for term in ["elective", "general elective", "elective only"])):
+            approval_data["major_minor"] = text
+            
         # Enhanced signature detection for common names
         # Look for any text that contains common signature patterns
         if any(name in text for name in ["Erin Smith", "erin smith", "Erin", "Smith"]):
-            # If it's in an elective context, mark as elective
-            if any(term in text.lower() for term in ["elective", "general elective"]):
+            # Check if this is in an elective context by looking for nearby text
+            nearby_text = " ".join([block["text"] for block in nearby_blocks if block["text"]])
+            if any(term in nearby_text.lower() for term in ["elective", "general elective", "elective only"]):
                 approval_data["elective"] = text
             # Otherwise, mark as major/minor
             else:
                 approval_data["major_minor"] = text
+                
+        # Also check for Rohan Palma signatures
+        if any(name in text for name in ["Rohan Palma", "rohan palma", "Rohan", "Palma", "RP"]):
+            # Rohan Palma signatures are typically elective
+            approval_data["elective"] = text
             
         # Check for UR Equivalent patterns
         # Look for course codes like "FIN 224", "FIN 242", "N/A"
@@ -1021,6 +1036,14 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
         
         # Use text-based UR Equivalent if form fields are empty
         ur_equivalent = (near_eq or {}).get("value","") or text_approval_data.get("ur_equivalent", "")
+        
+        # Enhanced signature detection - if we found signatures in text blocks, use them
+        if text_approval_data.get("elective") or text_approval_data.get("major_minor"):
+            # Override signature detection based on text findings
+            if text_approval_data.get("elective"):
+                signature_detected["elective"] = True
+            if text_approval_data.get("major_minor"):
+                signature_detected["major_minor"] = True
         
         # Map approval type using signature detection
         approval_type = map_approval_type_from_signatures(
