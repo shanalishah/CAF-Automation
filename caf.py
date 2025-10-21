@@ -117,6 +117,11 @@ def parse_course_code_and_title(course_text: str) -> tuple:
     if match6:
         return match6.group(1).strip(), match6.group(2).strip()
     
+    # Pattern 6a: Handle formats like "PO/EC 246 European Union Policies in Practice"
+    match6a = re.match(r"^([A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4})\s+(.+)$", course_text.strip())
+    if match6a:
+        return match6a.group(1).strip(), match6a.group(2).strip()
+    
     # Pattern 7: Try to extract just the code part at the beginning
     code_match = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)", course_text.strip())
     if code_match:
@@ -264,6 +269,7 @@ def extract_program_info(program_text: str) -> tuple:
     if not program_text:
         return "", "", ""
     
+    
     # Common patterns for extracting location info
     program_lower = program_text.lower()
     
@@ -348,24 +354,43 @@ def extract_program_info(program_text: str) -> tuple:
         
         return program_text, city, country
     
+    # Check for explicit city/country patterns in the text
+    city = ""
+    country = ""
+    
+    # Look for known cities in the program text
+    for city_key, (city_name, country_name) in city_country_map.items():
+        if city_key in program_lower:
+            city = city_name
+            country = country_name
+            break
+    
+    # If we found a city, return it; otherwise return blank
+    if city and country:
+        return program_text, city, country
+    
     # Try to extract city and country from common patterns
+    # Be more restrictive - only match if it looks like a real city, country pattern
     city_country_patterns = [
-        (r"([^,]+),\s*([^,]+)$", "city, country"),
-        (r"([^,]+)\s*-\s*([^,]+)$", "university - city"),
+        (r"([^,]+),\s*([A-Za-z\s]+)$", "city, country"),
+        (r"([^,]+)\s*-\s*([A-Za-z\s]+)$", "university - city"),
     ]
     
     for pattern, _ in city_country_patterns:
         match = re.search(pattern, program_text)
         if match:
             part1, part2 = match.groups()
-            # Simple heuristics - you might need to refine this
-            if len(part2.strip()) <= 20 and not any(word in part2.lower() for word in ["university", "college", "institute"]):
+            # More restrictive heuristics - avoid program descriptions
+            if (len(part2.strip()) <= 20 and 
+                not any(word in part2.lower() for word in ["university", "college", "institute", "politics", "law", "economics", "studies", "program"]) and
+                not any(word in part1.lower() for word in ["ies", "abroad", "program", "studies"])):
                 return program_text, part1.strip(), part2.strip()
     
+    # If no clear city/country found, return blank
     return program_text, "", ""
 
 COURSE_LINE_RE = re.compile(
-    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+", re.M
+    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+|^[A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4}\s+.+", re.M
 )
 
 TERM_RE = re.compile(r"\b(fall|spring|summer|winter)\b", re.I)
@@ -1075,43 +1100,84 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
     return pd.DataFrame(), "None", header
 
 # ------------- Streamlit UI -------------
-upl = st.file_uploader("Upload CAF PDF", type=["pdf"])
-if not upl:
-    st.info("Upload a PDF to begin.")
-    st.stop()
+st.sidebar.header("Upload Options")
+upload_mode = st.sidebar.radio("Choose upload mode:", ["Single File", "Bulk Upload"])
 
-pdf_bytes = upl.read()
-
-with st.spinner("Parsing PDF..."):
-    df, path, header = build_rows(pdf_bytes)
-
-st.subheader("Results")
-if df.empty:
-    st.error("No rows detected from forms, text, or OCR. Try a clearer scan or another file.")
-else:
-    st.success(f"Parsed {len(df)} course row(s) via **{path}**.")
+if upload_mode == "Single File":
+    upl = st.file_uploader("Upload CAF PDF", type=["pdf"])
+    if not upl:
+        st.info("Upload a PDF to begin.")
+        st.stop()
     
+    pdf_files = [upl]
+    file_names = [upl.name]
+else:
+    upl = st.file_uploader("Upload multiple CAF PDFs", type=["pdf"], accept_multiple_files=True)
+    if not upl:
+        st.info("Upload one or more PDFs to begin.")
+        st.stop()
+    
+    pdf_files = upl
+    file_names = [f.name for f in upl]
+
+# Process files
+all_results = []
+all_headers = []
+
+for i, (pdf_file, file_name) in enumerate(zip(pdf_files, file_names)):
+    st.write(f"Processing {file_name}...")
+    pdf_bytes = pdf_file.read()
+    
+    with st.spinner(f"Parsing {file_name}..."):
+        df, path, header = build_rows(pdf_bytes)
+    
+    if not df.empty:
+        # Add source file column
+        df['Source File'] = file_name
+        all_results.append(df)
+        all_headers.append(header)
+        st.success(f"✓ {file_name}: {len(df)} course(s) extracted via **{path}**")
+    else:
+        st.warning(f"⚠ {file_name}: No courses detected")
+
+# Combine all results
+if all_results:
+    combined_df = pd.concat(all_results, ignore_index=True)
+    st.subheader(f"Combined Results ({len(combined_df)} total courses from {len(all_results)} files)")
+else:
+    combined_df = pd.DataFrame()
+    st.error("No courses detected from any files.")
+
+# Display results
+if combined_df.empty:
+    st.error("No courses detected from any files. Try clearer scans or different files.")
+else:
     # Create the final output DataFrame with only the desired columns
     output_columns = [
-        "Program/University", "City", "Country", "Course Code", "Course Title",
+        "Source File", "Program/University", "City", "Country", "Course Code", "Course Title",
         "UR Equivalent", "Major/Minor or Elective", "UR Credits", "Foreign Credits",
         "Course Page Link", "Syllabus Link"
     ]
     
+    # Ensure all columns exist in the DataFrame
+    for col in output_columns:
+        if col not in combined_df.columns:
+            combined_df[col] = ""
+    
     # Filter to only include the desired columns
-    final_df = df[output_columns].copy()
+    final_df = combined_df[output_columns].copy()
     
     # Display the data without filter row
     st.dataframe(final_df, use_container_width=True)
     
     # For download, create CSV without filter row
     csv_data = final_df.to_csv(index=False)
-    st.download_button("Download CSV", csv_data.encode("utf-8"),
-                       file_name="caf_extracted.csv", mime="text/csv")
+    st.download_button("Download Combined Results as CSV", csv_data.encode("utf-8"),
+                       file_name="caf_bulk_results.csv", mime="text/csv")
     
     # Show debug info in expander
     with st.expander("Debug: Original Data"):
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(combined_df, use_container_width=True)
     
     # Show signature detection debug info
     with st.expander("Debug: Signature Detection"):
