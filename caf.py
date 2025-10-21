@@ -758,6 +758,11 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
         if block["page"] == page and abs(block["y0"] - course_y) <= y_tolerance:
             nearby_blocks.append(block)
     
+    # Debug: Print all nearby blocks to see what we're finding
+    print(f"DEBUG: Course Y={course_y}, Found {len(nearby_blocks)} nearby blocks:")
+    for block in nearby_blocks:
+        print(f"  Y={block['y0']}: '{block['text']}'")
+    
     # Look for approval-related text patterns
     for block in nearby_blocks:
         text = block["text"].strip()
@@ -813,6 +818,30 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
         # Check for comments
         if any(term in text.lower() for term in ["general elective", "elective only", "comment", "not approved", "approved"]):
             approval_data["comments"] = text
+    
+    # If no signatures found in text blocks, try OCR as fallback for handwritten signatures
+    if not approval_data["elective"] and not approval_data["major_minor"]:
+        print(f"DEBUG: No signatures found in text blocks, trying OCR for course Y={course_y}")
+        try:
+            from pdf2image import convert_from_bytes
+            import pytesseract
+            
+            # Convert PDF page to image
+            images = convert_from_bytes(pdf_bytes, first_page=page+1, last_page=page+1)
+            if images:
+                # Use OCR to extract text from the image
+                ocr_text = pytesseract.image_to_string(images[0])
+                print(f"DEBUG: OCR extracted text: '{ocr_text[:200]}...'")
+                
+                # Look for signatures in OCR text
+                if "erin smith" in ocr_text.lower():
+                    print("DEBUG: Found Erin Smith in OCR text")
+                    approval_data["major_minor"] = "Erin Smith (OCR)"
+                if "rohan palma" in ocr_text.lower():
+                    print("DEBUG: Found Rohan Palma in OCR text")
+                    approval_data["elective"] = "Rohan Palma (OCR)"
+        except Exception as e:
+            print(f"DEBUG: OCR failed: {e}")
     
     return approval_data
 
