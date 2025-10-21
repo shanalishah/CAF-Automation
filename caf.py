@@ -764,9 +764,13 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
         if not text:
             continue
             
+        # Debug: Print all text blocks to see what we're finding
+        if "erin" in text.lower() or "smith" in text.lower() or "rohan" in text.lower() or "palma" in text.lower():
+            print(f"DEBUG: Found signature text: '{text}' at Y={block['y0']}")
+            
         # Check for elective approval patterns (from previous form)
         # Look for specific patterns that indicate elective approval
-        if any(term in text.lower() for term in ["rohan", "palma", "rp", "general elective", "elective only", "erin smith"]):
+        if any(term in text.lower() for term in ["rohan", "palma", "rp", "general elective", "elective only"]):
             approval_data["elective"] = text
             
         # Also check for "Erin Smith" in elective context
@@ -776,25 +780,21 @@ def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, pa
         # Check for major/minor approval patterns with handwritten signatures
         # Look for patterns like "INTR: PPD", "INTR: GoN; PaC", or handwritten names
         # But exclude elective-specific terms
-        if (any(term in text.lower() for term in ["intr:", "major", "minor", "erin smith"]) and 
+        if (any(term in text.lower() for term in ["intr:", "major", "minor"]) and 
             not any(term in text.lower() for term in ["elective", "general elective", "elective only"])):
             approval_data["major_minor"] = text
             
-        # Also check for "Erin Smith" in major/minor context (not in elective context)
-        if ("erin smith" in text.lower() and 
-            not any(term in text.lower() for term in ["elective", "general elective", "elective only"])):
-            approval_data["major_minor"] = text
-            
-        # Enhanced signature detection for common names
-        # Look for any text that contains common signature patterns
-        if any(name in text for name in ["Erin Smith", "erin smith", "Erin", "Smith"]):
+        # Check for "Erin Smith" signatures - these are typically Major/Minor unless in elective context
+        if "erin smith" in text.lower():
             # Check if this is in an elective context by looking for nearby text
             nearby_text = " ".join([block["text"] for block in nearby_blocks if block["text"]])
             if any(term in nearby_text.lower() for term in ["elective", "general elective", "elective only"]):
                 approval_data["elective"] = text
-            # Otherwise, mark as major/minor
             else:
+                # Default to Major/Minor for Erin Smith signatures
                 approval_data["major_minor"] = text
+            
+        # Enhanced signature detection for common names (already handled above for Erin Smith)
                 
         # Also check for Rohan Palma signatures
         if any(name in text for name in ["Rohan Palma", "rohan palma", "Rohan", "Palma", "RP"]):
