@@ -220,11 +220,22 @@ def map_approval_type_from_signatures(
     # Final merge
     return ", ".join(result) if result else ""
 
+TERM_RE = re.compile(r"\b(fall|spring|summer|winter)\b", re.I)
+DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
 def extract_program_info(program_text: str) -> tuple:
     """
-    Try to infer (Program/University, City, Country) from header program text.
+    Return (Program/University, City, Country)
+    If program_text is empty or looks like internal UR stuff, return ("", "", "").
     """
     if not program_text:
+        return "", "", ""
+
+    # Reject obvious internal junk again
+    if "rochester.edu" in program_text.lower():
+        return "", "", ""
+    if re.search(r"https?://", program_text, re.I):
         return "", "", ""
 
     program_lower = program_text.lower()
@@ -261,43 +272,26 @@ def extract_program_info(program_text: str) -> tuple:
         "cairo": ("Cairo", "Egypt"),
         "munich": ("Munich", "Germany"),
         "christchurch": ("Christchurch", "New Zealand"),
+        "birmingham": ("Birmingham", "United Kingdom"),
     }
 
-    # IES Abroad, CIEE patterns
-    if "ies abroad" in program_lower or "ies " in program_lower:
+    # If we see "CIEE", "IES Abroad", "Exchange", etc:
+    if "ciee" in program_lower or "ies abroad" in program_lower or "exchange" in program_lower:
+        city = ""
+        country = ""
         for key, (cty, ctry) in city_country_map.items():
             if key in program_lower:
-                return program_text, cty, ctry
-        return program_text, "", ""
+                city, country = cty, ctry
+                break
+        return program_text, city, country
 
-    if "ciee" in program_lower:
-        for key, (cty, ctry) in city_country_map.items():
-            if key in program_lower:
-                return program_text, cty, ctry
-        return program_text, "", ""
-
-    # generic city best-effort
+    # "Birmingham City University" etc.
     for key, (cty, ctry) in city_country_map.items():
         if key in program_lower:
             return program_text, cty, ctry
 
+    # default: keep name, blank city/country
     return program_text, "", ""
-
-COURSE_LINE_RE = re.compile(
-    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
-    r"^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
-    r"^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|"
-    r"^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|"
-    r"^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|"
-    r"^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|"
-    r"^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+|"
-    r"^[A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4}\s+.+",
-    re.M
-)
-
-TERM_RE = re.compile(r"\b(fall|spring|summer|winter)\b", re.I)
-DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 def ocr_text(pdf_bytes: bytes, dpi: int = 300) -> str:
     images = convert_from_bytes(pdf_bytes, dpi=dpi)
@@ -352,6 +346,18 @@ def page_blocks(pdf_bytes: bytes):
                     "text": text or ""
                 })
     return blocks
+
+COURSE_LINE_RE = re.compile(
+    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|"
+    r"^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|"
+    r"^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+|"
+    r"^[A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4}\s+.+",
+    re.M
+)
 
 def extract_courses_by_blocks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     """
@@ -489,7 +495,6 @@ def extract_approval_data_from_text_blocks(
             approval_data["major_minor"] = text
 
         # Detect UR equivalent pattern like "FIN 224" / "N/A"
-        # crude pattern: looks like 2-4 letters + number, or "N/A"
         if (
             re.match(r"^[A-Z]{2,4}\s+\d{2,4}$", text.strip())
             or text.strip().upper() == "N/A"
@@ -504,15 +509,23 @@ def extract_approval_data_from_text_blocks(
 
     return approval_data
 
-# ---------------- Header inference ----------------
 def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) -> Dict[str, str]:
     fd = {(k or "").strip().lower(): norm_space(v) for k, v in (fields or {}).items()}
+
+    def looks_like_url(v: str) -> bool:
+        return bool(re.search(r"https?://", v, re.I))
 
     def pick_by_key(keys, avoid=None, value_re=None):
         avoid = avoid or []
         for k, v in fd.items():
             if not v:
                 continue
+            # skip obvious junk like URLs or Rochester boilerplate
+            if looks_like_url(v):
+                continue
+            if "rochester.edu" in v.lower():
+                continue
+
             if any(key in k for key in keys) and not any(bad in k for bad in avoid):
                 if value_re and not re.search(value_re, v, re.I):
                     continue
@@ -523,6 +536,10 @@ def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) ->
     name = pick_by_key(["name"], avoid=["course", "comments", "equiv", "approve"])
     if not name:
         for v in fd.values():
+            if not v:
+                continue
+            if looks_like_url(v):
+                continue
             if re.match(r"^[A-Za-z][A-Za-z .'-]+ [A-Za-z][A-Za-z .'-]+$", v):
                 name = v
                 break
@@ -531,6 +548,8 @@ def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) ->
     student_id = pick_by_key(["student", "id"], value_re=r"^\d{5,10}$")
     if not student_id:
         for v in fd.values():
+            if not v:
+                continue
             if re.fullmatch(r"\d{5,10}", v or ""):
                 student_id = v
                 break
@@ -539,6 +558,8 @@ def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) ->
     class_year = pick_by_key(["class"], value_re=r"^\d{4}$")
     if not class_year:
         for v in fd.values():
+            if not v:
+                continue
             m = YEAR_RE.search(v or "")
             if m and len(v) <= 6:
                 class_year = m.group(0)
@@ -548,51 +569,85 @@ def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) ->
     date_val = pick_by_key(["date"], value_re=DATE_RE.pattern)
     if not date_val:
         for v in fd.values():
+            if not v:
+                continue
             m = DATE_RE.search(v or "")
             if m:
                 date_val = m.group(0)
                 break
 
-    # Program
+    # --- Program / Host University inference ---
+    # Step 1: look for explicit keys like "program", "study abroad program", etc.
     program = pick_by_key(
-        ["college where", "study abroad", "program", "college"],
+        ["study abroad", "host university", "host institution", "program", "college where"],
         avoid=["course", "comments", "equiv", "approve", "class", "semester", "id", "date", "name"]
     )
+
+    # Step 2: fallback heuristic from fields
     if not program:
         candidates = []
         for k, v in fd.items():
             if not v:
                 continue
-            if any(bad in k for bad in ["course", "comments", "equiv", "approve", "majorminor", "class", "semester", "id", "date", "name"]):
+            if looks_like_url(v):
                 continue
+            if "rochester.edu" in v.lower():
+                continue
+
+            # skip things that are clearly not a provider/university
+            if any(bad in k for bad in [
+                "course", "comment", "equiv", "approve", "majorminor",
+                "class", "semester", "id", "date", "name", "signature",
+                "advisor", "chair", "dean"
+            ]):
+                continue
+
+            # keep things likely to be a host program
+            # hints: University, College, Institute, CIEE, IES Abroad, Exchange, Business School
             if re.search(
-                r"(university|college|program|institute|ies|ciee|arcadia|barcelona|madrid|london|paris|florence|milan|prague)",
+                r"(university|college|institute|institut|academy|exchange|ciee|ies abroad|study abroad|business school)",
                 v,
                 re.I
             ):
                 candidates.append(v)
+
         if candidates:
+            # choose the longest string (often "University of X, City, Country")
             program = max(candidates, key=len)
 
-    # last resort: scan visible text for program-ish strings
-    if not program:
+    # Step 3: last resort, scan visible text blocks for likely program text
+    if not program and pdf_bytes:
         try:
             for block in page_blocks(pdf_bytes):
                 text = block["text"].strip()
+                if not text:
+                    continue
+                if looks_like_url(text):
+                    continue
+                if "rochester.edu" in text.lower():
+                    continue
+
+                # must mention something that sounds like a host site, not instructions
                 if (
-                    re.search(r"(ies abroad|ciee|university|college|program)", text, re.I)
-                    and len(text) > 20
-                    and not re.search(r"course|subject|number|title", text, re.I)
+                    re.search(r"(university|college|institute|ciee|ies abroad|exchange|business school)", text, re.I)
+                    and not re.search(r"(course|subject|number|title|instructions|advisor|signature)", text, re.I)
+                    and len(text) > 15
                 ):
                     program = text
                     break
         except Exception:
             pass
 
+    # Final cleanup: if we STILL don't trust it, blank it out
+    if program and ("rochester.edu" in program.lower() or looks_like_url(program)):
+        program = ""
+
     # Semester / Term
-    semester = pick_by_key(["semester"], value_re=TERM_RE.pattern)
+    semester = pick_by_key(["semester", "term"], value_re=TERM_RE.pattern)
     if not semester:
         for v in fd.values():
+            if not v:
+                continue
             if TERM_RE.search(v or ""):
                 semester = v
                 break
@@ -705,9 +760,7 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
     w_mm     = pick_widgets_containing("majorminorapproval")
     w_comm   = pick_widgets_containing("comments")
     w_equiv  = pick_widgets_containing("equivalent")
-    # w_courses_form is not strictly used, but we keep the logic
-    # to maintain the structure
-    w_courses_form = pick_widgets_containing("course")
+    w_courses_form = pick_widgets_containing("course")  # not directly used but keeps structure
 
     # ---------- PATH A: structured "Course1 / Equivalent1 / ..." fields ----------
     rows_path_a: List[Dict[str, Any]] = []
@@ -722,7 +775,7 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
         if m:
             indices.add(int(m.group(2)))
 
-    # detect visual signatures once at top (saves work per row)
+    # detect visual signatures once at top
     visual_signatures = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
 
     for i in sorted(indices):
@@ -737,11 +790,11 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
             continue
 
         course_code, course_title = parse_course_code_and_title(raw_course)
-        ur_equivalent = raw_equiv  # <-- FIX: define so it's always available
+        ur_equivalent = raw_equiv  # <-- define so it's always available
 
         program_name, city, country = extract_program_info(header.get("Program", ""))
 
-        # infer signature presence from visual_signatures for this index:
+        # infer signature presence for this index:
         signature_detected = {"elective": False, "major_minor": False}
         elec_widget_name = f"ElecApprove{i}"
         mm_widget_name = f"MajorMinorApproval{i}"
@@ -806,7 +859,7 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
             c["page"]
         )
 
-        # also factor in visual signatures
+        # also factor in text-based signature hints
         if text_approval_data.get("elective"):
             sig_detect_local["elective"] = True
         if text_approval_data.get("major_minor"):
@@ -1063,7 +1116,6 @@ else:
             st.write("No visual signatures detected.")
 
 with st.expander("Debug: Header & Raw Form Fields"):
-    # NOTE: pdf_bytes will be last processed file's bytes
     st.write("Header inference:", all_headers[-1] if all_headers else {})
     if 'pdf_bytes' in locals():
         widgets, fields = read_form_widgets(pdf_bytes)
