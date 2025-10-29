@@ -1,5 +1,5 @@
-# app.py — CAF Extractor (Forms + Text + OCR, y-position row mapping)
-# Run: streamlit run app.py
+# caf.py — CAF Extractor (Forms + Text + OCR, y-position row mapping)
+# Run: streamlit run caf.py
 
 import re
 from io import BytesIO
@@ -11,19 +11,23 @@ import fitz  # PyMuPDF
 from pdf2image import convert_from_bytes
 import pytesseract
 import numpy as np
-
-# Configure pytesseract for Streamlit Cloud
-try:
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-except:
-    pass  # Use default path if not found
 from PIL import Image
 
+# Configure pytesseract for Streamlit Cloud (best effort)
+try:
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+except Exception:
+    pass
+
+# ---------------- Streamlit page config ----------------
 st.set_page_config(page_title="CAF Extractor (Robust)", layout="wide")
 st.title("Course Approval Form → Table")
-st.caption("Uploads a CAF PDF and extracts fields via Form Fields → Text → OCR (fallback). Rows aligned by y-position.")
+st.caption(
+    "Uploads a CAF PDF and extracts fields via Form Fields → Text → OCR (fallback). "
+    "Rows aligned by vertical position, approval logic inferred from signatures."
+)
 
-# ------------- Utilities -------------
+# ---------------- Utilities ----------------
 def norm_space(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[ \t]+", " ", s)
@@ -31,249 +35,200 @@ def norm_space(s: str) -> str:
     return s
 
 def clean_course_text(t: str) -> str:
-    # Remove trailing "Link to course description" lines and collapse spaces
+    # Remove trailing "Link to course description" style text and collapse spaces
     t = t.replace("\n", " ").strip()
     t = re.sub(r"\s*Link to course description.*$", "", t, flags=re.I)
     t = re.sub(r"\s+", " ", t)
     return t.strip(" -:")
 
 def parse_course_code_and_title(course_text: str) -> tuple:
-    """Extract course code and title from course text like 'BA-BHAAV1058U Management Accounting'"""
+    """
+    Try to split a raw line like:
+    - 'POLI 3003 PRAG The Rise and Fall ...'
+    - 'BBLCO1221U – Corporate Finance'
+    - 'FI 356 - International Financial Markets and Investments'
+    - '(GI) Econ 3006 PRCZ Economics of the European Union'
+    into (course_code, course_title).
+    """
     if not course_text:
         return "", ""
-    
-    # Pattern 1: Handle formats like "(GI) Econ 3006 PRCZ Economics of the European Union"
-    # Allow mixed case for subject codes like "Econ"
-    match1 = re.match(r"^\(([A-Z]+)\)\s+([A-Za-z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", course_text.strip())
+
+    text = course_text.strip()
+
+    # Pattern: "(GI) Econ 3006 PRCZ Economics of the European Union"
+    match1 = re.match(r"^\(([A-Z]+)\)\s+([A-Za-z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", text)
     if match1:
         prefix = match1.group(1)
         code = match1.group(2)
         title = match1.group(3)
         return f"({prefix}) {code}", title
-    
-    # Pattern 1a: More flexible pattern for "(GI) Econ 3006 PRCZ Economics of the European Union"
-    match1a = re.match(r"^\(([A-Z]+)\)\s+([A-Z]{2,4})\s+(\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", course_text.strip())
+
+    # Variant with separated subject and code blocks
+    match1a = re.match(r"^\(([A-Z]+)\)\s+([A-Z]{2,4})\s+(\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", text)
     if match1a:
         prefix = match1a.group(1)
-        subject = match1a.group(2)
+        subj = match1a.group(2)
         code_part = match1a.group(3)
         title = match1a.group(4)
-        return f"({prefix}) {subject} {code_part}", title
-    
-    # Pattern 1b: Handle formats like "(GI) Econ 3006 PRCZ Economics of the European Union" (alternative pattern)
-    match1b = re.match(r"^\(([A-Z]+)\)\s+([A-Z]{2,4})\s+(\d{2,4}\s+[A-Z]{2,4}\s+.+)$", course_text.strip())
-    if match1b:
-        prefix = match1b.group(1)
-        subject = match1b.group(2)
-        rest = match1b.group(3)
-        # Split the rest into code and title
-        parts = rest.split(' ', 1)
-        if len(parts) == 2:
-            code_part = parts[0]
-            title = parts[1]
-            return f"({prefix}) {subject} {code_part}", title
-    
-    # Pattern 2: Handle formats like "POLI 3003 PRAG The Rise and Fall of Central European Totalitarianism"
-    match2 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", course_text.strip())
+        return f"({prefix}) {subj} {code_part}", title
+
+    # Pattern: "POLI 3003 PRAG The Rise and Fall ..."
+    match2 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4})\s+(.+)$", text)
     if match2:
         return match2.group(1).strip(), match2.group(2).strip()
-    
-    # Pattern 3: Handle formats like "CU 270: Culture and Cuisine" (with colon)
-    match3 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}[A-Z]?)\s*:\s*(.+)$", course_text.strip())
+
+    # Pattern: "CU 270: Culture and Cuisine"
+    match3 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}[A-Z]?)\s*:\s*(.+)$", text)
     if match3:
         return match3.group(1).strip(), match3.group(2).strip()
-    
-    # Pattern 4: Handle formats like "CU 270-01 - 2163268-Culture and Cuisine" (with internal ID)
-    match4 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?)\s*-\s*(\d{7})-(.+)$", course_text.strip())
+
+    # Pattern: "CU 270-01 - 2163268-Culture and Cuisine"
+    match4 = re.match(r"^([A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?)\s*-\s*(\d{7})-(.+)$", text)
     if match4:
         code = match4.group(1).strip()
-        internal_id = match4.group(2).strip()
         title = match4.group(3).strip()
         return code, title
-    
-    # Pattern 4b: Handle formats like "BOCCONI 30150 - Introduction to Options and Futures"
-    match4b = re.match(r"^([A-Z]{2,8}\s+\d{2,5})\s*-\s*(.+)$", course_text.strip())
+
+    # Pattern: "BOCCONI 30150 - Introduction to Options and Futures"
+    match4b = re.match(r"^([A-Z]{2,8}\s+\d{2,5})\s*-\s*(.+)$", text)
     if match4b:
         return match4b.group(1).strip(), match4b.group(2).strip()
-    
-    # Pattern 4c: Handle formats like "FI 356 - International Financial Markets and Investments"
-    match4c = re.match(r"^([A-Z]{2,4}\s+\d{2,4})\s*-\s*(.+)$", course_text.strip())
+
+    # Pattern: "FI 356 - International Financial Markets and Investments"
+    match4c = re.match(r"^([A-Z]{2,4}\s+\d{2,4})\s*-\s*(.+)$", text)
     if match4c:
         return match4c.group(1).strip(), match4c.group(2).strip()
-    
-    # Pattern 4a: Handle formats like "BBLCO1221U – Corporate Finance" (with em dash)
-    match4a = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)\s*[–-]\s*(.+)$", course_text.strip())
+
+    # Pattern: "BBLCO1221U – Corporate Finance" (en dash / hyphen)
+    match4a = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)\s*[–-]\s*(.+)$", text)
     if match4a:
         return match4a.group(1).strip(), match4a.group(2).strip()
-    
-    # Pattern 5: Handle formats like "BA-BHAAV1058U Management Accounting and Control Systems"
-    # This matches: prefix (optional) + course code + space + title
-    match5 = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)\s+(.+)$", course_text.strip())
+
+    # Pattern: "BA-BHAAV1058U Management Accounting ..."
+    match5 = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)\s+(.+)$", text)
     if match5:
         return match5.group(1).strip(), match5.group(2).strip()
-    
-    # Pattern 6: Handle traditional formats like "ASIA2041 - Mainland Southeast Asia"
-    match6 = re.match(r"^([A-Z]{1,4}(?:/[A-Z]{1,4})?\s*\d{2,3}[A-Z]?)\s*[-–]\s*(.+)$", course_text.strip())
+
+    # Pattern: "ASIA2041 - Mainland Southeast Asia"
+    match6 = re.match(r"^([A-Z]{1,4}(?:/[A-Z]{1,4})?\s*\d{2,3}[A-Z]?)\s*[-–]\s*(.+)$", text)
     if match6:
         return match6.group(1).strip(), match6.group(2).strip()
-    
-    # Pattern 6a: Handle formats like "PO/EC 246 European Union Policies in Practice"
-    match6a = re.match(r"^([A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4})\s+(.+)$", course_text.strip())
+
+    # Pattern: "PO/EC 246 European Union Policies in Practice"
+    match6a = re.match(r"^([A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4})\s+(.+)$", text)
     if match6a:
         return match6a.group(1).strip(), match6a.group(2).strip()
-    
-    # Pattern 7: Try to extract just the code part at the beginning
-    code_match = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)", course_text.strip())
-    if code_match:
-        code = code_match.group(1).strip()
-        title = course_text.replace(code, "").strip(" -:").strip()
-        return code, title
-    
-    return "", course_text
 
-def detect_signature_in_widgets(widgets: List[Dict], course_y: float, page: int, y_tolerance: float = 15.0) -> Dict[str, bool]:
+    # Fallback: guess first token is code
+    code_guess = re.match(r"^([A-Z]{2,10}(?:-[A-Z0-9]+)*[A-Z0-9]+)", text)
+    if code_guess:
+        code = code_guess.group(1).strip()
+        title = text.replace(code, "").strip(" -:").strip()
+        return code, title
+
+    return "", text
+
+def detect_signature_in_widgets(
+    widgets: List[Dict],
+    course_y: float,
+    page: int,
+    y_tolerance: float = 15.0
+) -> Dict[str, bool]:
     """
-    Detect if there are signatures in approval widgets near a course.
-    This handles both text signatures and visual signatures (filled fields).
-    Returns dict with 'elective' and 'major_minor' boolean flags.
+    Look at PDF widgets close to the course row.
+    Decide if those widgets look like they contain a signature
+    (elective vs major/minor).
     """
     signature_detected = {"elective": False, "major_minor": False}
-    
+
     for widget in widgets:
         if widget["page"] != page:
             continue
-            
-        # Check if widget is near the course (within y tolerance)
-        if abs(widget["y0"] - course_y) <= y_tolerance:
-            widget_name = (widget["name"] or "").lower()
-            widget_value = (widget["value"] or "").strip()
-            
-            # Check if there's a signature (text or visual)
-            has_signature = False
-            
-            # Method 1: Check for text signatures
-            if widget_value:
-                # Check for common non-signature values
-                non_signature_values = ["", "no", "n", "none", "yes", "y", "approved", "denied", "na", "n/a"]
-                if widget_value.lower().strip() not in non_signature_values:
-                    # Additional check: if it looks like a name or initials, it's likely a signature
-                    if (len(widget_value.strip()) > 1 and 
-                        (any(c.isalpha() for c in widget_value) or 
-                         any(c in widget_value for c in [".", ",", " "]))):
-                        has_signature = True
-            
-            # Method 2: For visual signatures, if an approval widget exists near a course, 
-            # assume it has a signature (since signatures are drawn/placed visually)
-            if not has_signature and widget_name:
-                # Check if this is an approval widget
-                if "elec" in widget_name or any(term in widget_name for term in ["major", "minor"]):
+        if abs(widget["y0"] - course_y) > y_tolerance:
+            continue
+
+        widget_name = (widget["name"] or "").lower()
+        widget_value = (widget["value"] or "").strip()
+
+        has_signature = False
+
+        # text in the box that looks like initials/names (not just No/N/A/etc.)
+        if widget_value:
+            non_sig_values = ["", "no", "n", "none", "yes", "y", "approved", "denied", "na", "n/a"]
+            if widget_value.lower().strip() not in non_sig_values:
+                if (
+                    len(widget_value.strip()) > 1
+                    and (any(c.isalpha() for c in widget_value) or any(c in widget_value for c in [".", ",", " "]))
+                ):
                     has_signature = True
-            
-            # Map to the appropriate column
-            if "elec" in widget_name and has_signature:
-                signature_detected["elective"] = True
-            elif any(term in widget_name for term in ["major", "minor"]) and has_signature:
-                signature_detected["major_minor"] = True
-    
+
+        # heuristic: if the widget name itself implies an approval box
+        if not has_signature and widget_name:
+            if "elec" in widget_name or "major" in widget_name or "minor" in widget_name:
+                has_signature = True
+
+        # map
+        if "elec" in widget_name and has_signature:
+            signature_detected["elective"] = True
+        elif ("major" in widget_name or "minor" in widget_name) and has_signature:
+            signature_detected["major_minor"] = True
+
     return signature_detected
 
-def map_approval_type_from_signatures(signature_detected: Dict[str, bool], elective_approval: str, major_minor_approval: str, comments: str = "") -> str:
-    """Map approval fields based on signature detection, form values, and comments"""
+def map_approval_type_from_signatures(
+    signature_detected: Dict[str, bool],
+    elective_approval: str,
+    major_minor_approval: str,
+    comments: str = ""
+) -> str:
+    """
+    Turn signature + text context into final label:
+    "Elective", "Major, Minor", "Not Approved", etc.
+    """
     result = []
-    
-    print(f"  map_approval_type_from_signatures called with:")
-    print(f"    signature_detected: {signature_detected}")
-    print(f"    elective_approval: '{elective_approval}'")
-    print(f"    major_minor_approval: '{major_minor_approval}'")
-    print(f"    comments: '{comments}'")
-    
-    # If signatures were detected, use those
-    # Only add "Elective" if there's actually elective approval data
+
+    # Priority 1: visual/structural signatures near row
     if signature_detected["elective"] and elective_approval:
         result.append("Elective")
     if signature_detected["major_minor"] and major_minor_approval:
         result.append("Major, Minor")
-    
-    # Special case: if we have comments with signature patterns, assume Major/Minor approval
+
+    # Priority 2: comments with patterns
     if not result and comments:
-        comments_lower = comments.lower()
-        if any(term in comments_lower for term in ["intr:", "ppd", "gon", "pac"]):
+        c_low = comments.lower()
+        if any(term in c_low for term in ["intr:", "ppd", "gon", "pac"]):
             result.append("Major, Minor")
-    
-    print(f"    After signature check, result: {result}")
-    
-    # If no signatures detected, fall back to form field values
+
+    # Priority 3: fallback to field values
     if not result:
-        # Only add approval types if there's actual content in those fields
         if elective_approval and elective_approval.strip().lower() not in ["", "no", "n", "none"]:
             result.append("Elective")
         if major_minor_approval and major_minor_approval.strip().lower() not in ["", "no", "n", "none"]:
             result.append("Major, Minor")
-    
-    print(f"    After form field check, result: {result}")
-    
-    # Check comments for approval type indicators (this takes priority)
-    if comments:
-        comments_lower = comments.lower()
-        if any(term in comments_lower for term in ["not approved", "denied", "rejected"]):
-            result = ["Not Approved"]  # Override any previous result
-        elif not result:  # Only check other comment patterns if no result yet
-            if any(term in comments_lower for term in ["elective", "general elective", "elective only"]):
-                result.append("Elective")
-            elif any(term in comments_lower for term in ["major", "minor", "major/minor"]):
-                result.append("Major, Minor")
-    
-    # If still no result, check major/minor approval for signature patterns
-    if not result and major_minor_approval:
-        major_minor_lower = major_minor_approval.lower()
-        if any(term in major_minor_lower for term in ["intr:", "foogle", "signature"]):
-            result.append("Major, Minor")
-    
-    # If still no result, check comments for signature patterns (handwritten signatures)
-    if not result and comments:
-        comments_lower = comments.lower()
-        if any(term in comments_lower for term in ["intr:", "ppd", "gon", "pac"]):
-            result.append("Major, Minor")
-    
-    print(f"    After comments check, result: {result}")
-    
-    # If still no result, check if there are approval widgets present (indicating signatures might be visual)
-    if not result:
-        # Check if we have approval widgets but no text values - this suggests visual signatures
-        # But be more careful about what constitutes actual approval data
-        if elective_approval and elective_approval.strip() and not any(term in elective_approval.lower() for term in ["general credit", "n/a", "none"]):
-            result.append("Elective")
-        if major_minor_approval and major_minor_approval.strip() and not any(term in major_minor_approval.lower() for term in ["general credit", "n/a", "none"]):
-            result.append("Major, Minor")
-    
-    print(f"    Final result: {result}")
-    final_result = ", ".join(result) if result else ""
-    print(f"    Final string: '{final_result}'")
-    
-    return final_result
 
-def map_approval_type(elective_approval: str, major_minor_approval: str) -> str:
-    """Legacy function - kept for backward compatibility"""
-    result = []
-    
-    if elective_approval and elective_approval.strip().lower() not in ["", "no", "n", "none"]:
-        result.append("Elective")
-    
-    if major_minor_approval and major_minor_approval.strip().lower() not in ["", "no", "n", "none"]:
-        result.append("Major, Minor")
-    
+    # Priority 4: comments override (Not Approved)
+    if comments:
+        c_low = comments.lower()
+        if any(term in c_low for term in ["not approved", "denied", "rejected"]):
+            result = ["Not Approved"]
+        elif not result:
+            if any(term in c_low for term in ["elective", "general elective", "elective only"]):
+                result.append("Elective")
+            elif any(term in c_low for term in ["major", "minor", "major/minor"]):
+                result.append("Major, Minor")
+
+    # Final merge
     return ", ".join(result) if result else ""
 
 def extract_program_info(program_text: str) -> tuple:
-    """Extract university name, city, and country from program text"""
+    """
+    Try to infer (Program/University, City, Country) from header program text.
+    """
     if not program_text:
         return "", "", ""
-    
-    
-    # Common patterns for extracting location info
+
     program_lower = program_text.lower()
-    
-    # Known city-country mappings
+
     city_country_map = {
         "milan": ("Milan", "Italy"),
         "barcelona": ("Barcelona", "Spain"),
@@ -297,100 +252,47 @@ def extract_program_info(program_text: str) -> tuple:
         "seoul": ("Seoul", "South Korea"),
         "kyoto": ("Kyoto", "Japan"),
         "nagoya": ("Nagoya", "Japan"),
-        "waseda": ("Tokyo", "Japan"),  # Waseda University is in Tokyo
-        "yonsei": ("Seoul", "South Korea"),  # Yonsei University is in Seoul
+        "waseda": ("Tokyo", "Japan"),
+        "yonsei": ("Seoul", "South Korea"),
         "leeds": ("Leeds", "United Kingdom"),
         "bristol": ("Bristol", "United Kingdom"),
         "york": ("York", "United Kingdom"),
-        "newcastle": ("Newcastle", "Australia"),
         "auckland": ("Auckland", "New Zealand"),
         "cairo": ("Cairo", "Egypt"),
-        "bath": ("Bath", "United Kingdom"),
         "munich": ("Munich", "Germany"),
-        "salaya": ("Salaya", "Thailand"),
-        "christchurch": ("Christchurch", "New Zealand")
+        "christchurch": ("Christchurch", "New Zealand"),
     }
-    
-    # Handle IES Abroad patterns specifically
-    if "ies abroad" in program_lower or "ies milan" in program_lower:
-        # Pattern: "IES Abroad: Milan Business Studies"
-        ies_match = re.search(r"ies\s+abroad:\s*([^,]+)", program_text, re.I)
-        if ies_match:
-            location_part = ies_match.group(1).strip()
-            
-            # Extract city from location part
-            city = ""
-            country = ""
-            
-            # Check for city in the location part
-            for city_key, (city_name, country_name) in city_country_map.items():
-                if city_key in location_part.lower():
-                    city = city_name
-                    country = country_name
-                    break
-            
-            return program_text, city, country
-        
-        # Special case for "IES Milan / University of Bocconi"
-        if "milan" in program_lower:
-            return program_text, "Milan", "Italy"
-        
-        # Special case for "University of Bocconi"
-        if "bocconi" in program_lower:
-            return program_text, "Milan", "Italy"
-    
-    # Handle CIEE patterns specifically
+
+    # IES Abroad, CIEE patterns
+    if "ies abroad" in program_lower or "ies " in program_lower:
+        for key, (cty, ctry) in city_country_map.items():
+            if key in program_lower:
+                return program_text, cty, ctry
+        return program_text, "", ""
+
     if "ciee" in program_lower:
-        # Pattern: "CIEE Central European Studies in Prague, Czech Republic"
-        city = ""
-        country = ""
-        
-        # Check for city in the program text
-        for city_key, (city_name, country_name) in city_country_map.items():
-            if city_key in program_lower:
-                city = city_name
-                country = country_name
-                break
-        
-        return program_text, city, country
-    
-    # Check for explicit city/country patterns in the text
-    city = ""
-    country = ""
-    
-    # Look for known cities in the program text
-    for city_key, (city_name, country_name) in city_country_map.items():
-        if city_key in program_lower:
-            city = city_name
-            country = country_name
-            break
-    
-    # If we found a city, return it; otherwise return blank
-    if city and country:
-        return program_text, city, country
-    
-    # Try to extract city and country from common patterns
-    # Be more restrictive - only match if it looks like a real city, country pattern
-    city_country_patterns = [
-        (r"([^,]+),\s*([A-Za-z\s]+)$", "city, country"),
-        (r"([^,]+)\s*-\s*([A-Za-z\s]+)$", "university - city"),
-    ]
-    
-    for pattern, _ in city_country_patterns:
-        match = re.search(pattern, program_text)
-        if match:
-            part1, part2 = match.groups()
-            # More restrictive heuristics - avoid program descriptions
-            if (len(part2.strip()) <= 20 and 
-                not any(word in part2.lower() for word in ["university", "college", "institute", "politics", "law", "economics", "studies", "program"]) and
-                not any(word in part1.lower() for word in ["ies", "abroad", "program", "studies"])):
-                return program_text, part1.strip(), part2.strip()
-    
-    # If no clear city/country found, return blank
+        for key, (cty, ctry) in city_country_map.items():
+            if key in program_lower:
+                return program_text, cty, ctry
+        return program_text, "", ""
+
+    # generic city best-effort
+    for key, (cty, ctry) in city_country_map.items():
+        if key in program_lower:
+            return program_text, cty, ctry
+
     return program_text, "", ""
 
 COURSE_LINE_RE = re.compile(
-    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+|^[A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4}\s+.+", re.M
+    r"^\([A-Z]+\)\s+[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}\s+[A-Z]{2,4}\s+.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}[A-Z]?\s*[:\-–]\s*.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}(?:-\d{2})?\s*-\s*\d{7}-.+|"
+    r"^[A-Z]{2,8}\s+\d{2,5}\s*-\s*.+|"
+    r"^[A-Z]{2,4}\s+\d{2,4}\s*-\s*.+|"
+    r"^[A-Z]{2,10}(?:-[A-Z0-9]+)*\d+[A-Z0-9]*\s*[–-]\s*.+|"
+    r"^[A-Z]{1,4}/[A-Z]{1,4}\s+\d{2,4}\s+.+",
+    re.M
 )
 
 TERM_RE = re.compile(r"\b(fall|spring|summer|winter)\b", re.I)
@@ -404,223 +306,11 @@ def ocr_text(pdf_bytes: bytes, dpi: int = 300) -> str:
         parts.append(pytesseract.image_to_string(img))
     return norm_space("\n".join(parts))
 
-def get_manual_signature_mapping() -> Dict[str, bool]:
-    """
-    Manual signature mapping for the current PDF.
-    You can modify this function to specify which widgets have signatures.
-    
-    Based on your PDF, you'll need to specify which courses have signatures in which columns.
-    """
-    # This is a template - you need to fill in which widgets actually have signatures
-    # Set to True for widgets that have signatures, False for those that don't
-    
-    signature_map = {
-        # Elective approvals - only Management Accounting (Course3) has elective approval
-        "ElecApprove1": False,  # Strategic Thinking - Major/Minor
-        "ElecApprove2": False,  # Corporate Finance - Major/Minor
-        "ElecApprove3": True,   # Management Accounting - Elective
-        "ElecApprove4": False,  # Digital Finance Function - Major/Minor
-        "ElecApprove5": False,  # Business Strategy - Major/Minor
-        "ElecApprove6": False,  # Applied Pricing Management - Major/Minor
-        "ElecApprove7": False,  # Risk Management - Major/Minor
-        "ElecApprove8": False,  # Empty course
-        "ElecApprove9": False,  # Empty course
-        
-        # Major/Minor approvals - all except Management Accounting have major/minor approval
-        "MajorMinorApproval1": True,   # Strategic Thinking - Major/Minor
-        "MajorMinorApproval2": True,   # Corporate Finance - Major/Minor
-        "MajorMinorApproval3": False,  # Management Accounting - Elective
-        "MajorMinorApproval4": True,   # Digital Finance Function - Major/Minor
-        "MajorMinorApproval5": True,   # Business Strategy - Major/Minor
-        "MajorMinorApproval6": True,   # Applied Pricing Management - Major/Minor
-        "MajorMinorApproval7": True,   # Risk Management - Major/Minor
-        "MajorMinorApproval8": False,  # Empty course
-        "MajorMinorApproval9": False,  # Empty course
-    }
-    
-    return signature_map
-
-def detect_visual_signatures_in_pdf(pdf_bytes: bytes, widgets: List[Dict]) -> Dict[str, bool]:
-    """
-    Detect signatures by analyzing the PDF content and making intelligent decisions
-    based on the actual signature patterns found.
-    """
-    signature_map = {}
-    
-    try:
-        # First, try to detect using a simple approach: check for any visual content
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                
-                # Get all drawings and annotations on the page
-                drawings = page.get_drawings()
-                annotations = list(page.annots())
-                
-                # Look for approval widgets on this page
-                for widget in widgets:
-                    if widget["page"] != page_num:
-                        continue
-                    
-                    widget_name = (widget["name"] or "").lower()
-                    if "elec" in widget_name or any(term in widget_name for term in ["major", "minor"]):
-                        # Create a rectangle around the widget to check for visual content
-                        widget_rect = fitz.Rect(
-                            widget["x0"] - 3, widget["y0"] - 3,
-                            widget["x1"] + 3, widget["y1"] + 3
-                        )
-                        
-                        has_signature = False
-                        
-                        # Check for drawings that intersect with the widget area
-                        for drawing in drawings:
-                            for item in drawing.get("items", []):
-                                if item[0] in [1, 2, 3]:  # Line, rect, or curve
-                                    if len(item) >= 2:
-                                        if hasattr(item[1], 'x0'):  # It's a Rect
-                                            if widget_rect.intersects(item[1]):
-                                                has_signature = True
-                                                break
-                                        elif isinstance(item[1], (list, tuple)) and len(item[1]) >= 2:
-                                            x, y = item[1][0], item[1][1]
-                                            if widget_rect.x0 <= x <= widget_rect.x1 and widget_rect.y0 <= y <= widget_rect.y1:
-                                                has_signature = True
-                                                break
-                            if has_signature:
-                                break
-                        
-                        # Check for annotations
-                        if not has_signature:
-                            for annot in annotations:
-                                if annot.rect.intersects(widget_rect):
-                                    has_signature = True
-                                    break
-                        
-                        # Check for text content
-                        if not has_signature:
-                            text_in_area = page.get_text("text", clip=widget_rect)
-                            if text_in_area.strip() and len(text_in_area.strip()) > 1:
-                                has_signature = True
-                        
-                        signature_map[widget["name"]] = has_signature
-        
-        # If we detected some signatures, use them
-        if any(signature_map.values()):
-            print("Detected signatures automatically:", signature_map)
-            return signature_map
-        
-        # If no signatures detected, try a different approach
-        # Look for patterns in the widget names and positions
-        print("No signatures detected via drawings/annotations. Using pattern analysis...")
-        signature_map = analyze_signature_patterns(widgets)
-        
-    except Exception as e:
-        st.warning(f"Error in signature detection: {e}")
-        # Fallback: use pattern analysis
-        signature_map = analyze_signature_patterns(widgets)
-    
-    return signature_map
-
-def analyze_signature_patterns(widgets: List[Dict]) -> Dict[str, bool]:
-    """
-    Analyze patterns in the PDF to determine signature locations.
-    This is a heuristic approach for when visual detection fails.
-    """
-    signature_map = {}
-    
-    # Look for actual text content in approval widgets
-    for widget in widgets:
-        widget_name = (widget["name"] or "").lower()
-        widget_value = (widget["value"] or "").strip()
-        
-        if "elec" in widget_name or any(term in widget_name for term in ["major", "minor"]):
-            # Only mark as having signature if there's actual content
-            has_signature = False
-            
-            # Check for text signatures - be more permissive for handwritten signatures
-            if widget_value and widget_value.lower() not in ["", "no", "n", "none", "yes", "y", "approved", "denied"]:
-                has_signature = True
-            
-            # Check for specific patterns like "INTR: PPD", "INTR: GoN; PaC", "Not approved"
-            if any(pattern in widget_value for pattern in ["INTR:", "Not approved", "approved"]):
-                has_signature = True
-            
-            # Enhanced detection for common signatures like "Erin Smith"
-            if any(name in widget_value for name in ["Erin Smith", "erin smith", "Erin", "Smith", "Rohan Palma", "rohan palma"]):
-                has_signature = True
-            
-            # For handwritten signatures, look for any non-empty content that looks like a signature
-            if widget_value and len(widget_value.strip()) > 0:
-                # If it contains letters and looks like a name/signature, mark as signature
-                if any(c.isalpha() for c in widget_value) and len(widget_value.strip()) > 1:
-                    has_signature = True
-            
-            signature_map[widget["name"]] = has_signature
-    
-    print("Using pattern analysis (content-based):", signature_map)
-    return signature_map
-
-def detect_signatures_via_image_analysis(pdf_bytes: bytes, widgets: List[Dict]) -> Dict[str, bool]:
-    """
-    Detect signatures using image analysis of the PDF.
-    This converts the PDF to images and analyzes the visual content.
-    """
-    signature_map = {}
-    
-    try:
-        # Convert PDF to images
-        images = convert_from_bytes(pdf_bytes, dpi=300)
-        
-        for page_num, img in enumerate(images):
-            # Convert to numpy array for analysis
-            img_array = np.array(img)
-            
-            # Look for approval widgets on this page
-            for widget in widgets:
-                if widget["page"] != page_num:
-                    continue
-                
-                widget_name = (widget["name"] or "").lower()
-                if "elec" in widget_name or any(term in widget_name for term in ["major", "minor"]):
-                    # Convert widget coordinates to image coordinates
-                    # Note: This is a simplified approach - you might need to adjust scaling
-                    x0 = int(widget["x0"] * img.width / 612)  # Assuming 612pt page width
-                    y0 = int(widget["y0"] * img.height / 792)  # Assuming 792pt page height
-                    x1 = int(widget["x1"] * img.width / 612)
-                    y1 = int(widget["y1"] * img.height / 792)
-                    
-                    # Extract the widget area from the image
-                    if 0 <= x0 < img.width and 0 <= y0 < img.height and x0 < x1 and y0 < y1:
-                        widget_area = img_array[y0:y1, x0:x1]
-                        
-                        # Simple analysis: check if the area has significant non-white content
-                        # This is a basic approach - you could make it more sophisticated
-                        gray = np.mean(widget_area, axis=2) if len(widget_area.shape) == 3 else widget_area
-                        non_white_pixels = np.sum(gray < 240)  # Pixels that are not white
-                        total_pixels = gray.size
-                        
-                        # If more than 5% of pixels are not white, consider it a signature
-                        has_signature = (non_white_pixels / total_pixels) > 0.05
-                        signature_map[widget["name"]] = has_signature
-                    else:
-                        signature_map[widget["name"]] = False
-                        
-    except Exception as e:
-        st.warning(f"Error in image analysis: {e}")
-        # Return empty map
-        for widget in widgets:
-            widget_name = (widget["name"] or "").lower()
-            if "elec" in widget_name or any(term in widget_name for term in ["major", "minor"]):
-                signature_map[widget["name"]] = False
-    
-    return signature_map
-
-# ------------- PDF parsing (PyMuPDF) -------------
+# ---------------- PDF reading helpers ----------------
 def read_form_widgets(pdf_bytes: bytes):
     """
-    Return:
-      widgets: list of dicts with key, value, y0, y1, x0, x1
-      fields:  flat dict name->value
+    widgets: [{name,value,x0,y0,x1,y1,page}, ...]
+    fields:  {name:value, ...}
     """
     widgets = []
     fields = {}
@@ -633,8 +323,10 @@ def read_form_widgets(pdf_bytes: bytes):
                 item = {
                     "name": name,
                     "value": value,
-                    "x0": rect.x0, "y0": rect.y0,
-                    "x1": rect.x1, "y1": rect.y1,
+                    "x0": rect.x0,
+                    "y0": rect.y0,
+                    "x1": rect.x1,
+                    "y1": rect.y1,
                     "page": p.number
                 }
                 widgets.append(item)
@@ -644,21 +336,28 @@ def read_form_widgets(pdf_bytes: bytes):
 
 def page_blocks(pdf_bytes: bytes):
     """
-    Return list of dicts {page, x0,y0,x1,y1, text}
+    Returns list of text blocks for each page with geometry.
     """
     blocks = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         for p in doc:
             for b in p.get_text("blocks") or []:
                 x0, y0, x1, y1, text, *_ = b
-                blocks.append({"page": p.number, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": text or ""})
+                blocks.append({
+                    "page": p.number,
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                    "text": text or ""
+                })
     return blocks
 
 def extract_courses_by_blocks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Find course lines from text blocks. Returns list of {page, y, x0,x1, Course}
+    Scan visible text blocks for lines that look like course listings.
+    Tries to join multi-line titles.
     """
-    # Common form headers and instructions to exclude
     exclude_patterns = [
         r"^THE\s+COLLEGE",
         r"^COURSE\s+APPROVAL",
@@ -674,60 +373,64 @@ def extract_courses_by_blocks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
         r"^USE\s+ONLY\s*$",
         r"^ONLY\s*$"
     ]
-    
+
     rows = []
     for b in page_blocks(pdf_bytes):
         txt = b["text"]
         if not txt:
             continue
-        # Scan each line in the block, handling multi-line course titles
         lines = txt.splitlines()
         i = 0
         while i < len(lines):
             line_clean = lines[i].strip()
             if COURSE_LINE_RE.match(line_clean):
-                # Check if this line matches any exclusion patterns
-                should_exclude = False
-                for pattern in exclude_patterns:
-                    if re.match(pattern, line_clean, re.I):
-                        should_exclude = True
+                # skip if looks like header
+                skip = False
+                for patt in exclude_patterns:
+                    if re.match(patt, line_clean, re.I):
+                        skip = True
                         break
-                
-                if not should_exclude:
-                    # Check if the next line might be a continuation of the course title
-                    full_text = line_clean
+                full_text = line_clean
+                if not skip:
+                    # include next line if it's continuation
                     if i + 1 < len(lines):
                         next_line = lines[i + 1].strip()
-                        # If next line doesn't look like a new course and is not empty, append it
-                        if (next_line and 
-                            not COURSE_LINE_RE.match(next_line) and 
-                            not any(re.match(pattern, next_line, re.I) for pattern in exclude_patterns) and
-                            len(next_line) > 3):
+                        if (
+                            next_line
+                            and not COURSE_LINE_RE.match(next_line)
+                            and not any(re.match(patt, next_line, re.I) for patt in exclude_patterns)
+                            and len(next_line) > 3
+                        ):
                             full_text += " " + next_line
-                            i += 1  # Skip the next line since we've included it
-                    
+                            i += 1
                     rows.append({
                         "page": b["page"],
                         "x0": b["x0"],
                         "x1": b["x1"],
-                        "y": b["y0"],  # top of the block
+                        "y": b["y0"],  # top Y of the block
                         "Course": clean_course_text(full_text)
                     })
             i += 1
-    # Deduplicate same course detected across overlapping blocks
-    dedup = []
+
+    # Deduplicate by (page, y, text)
+    out = []
     seen = set()
-    for r in sorted(rows, key=lambda x: (x["page"], round(x["y"],1))):
-        key = (r["page"], round(r["y"],1), r["Course"])
+    for r in sorted(rows, key=lambda x: (x["page"], round(x["y"], 1))):
+        key = (r["page"], round(r["y"], 1), r["Course"])
         if key not in seen:
             seen.add(key)
-            dedup.append(r)
-    return dedup
+            out.append(r)
+    return out
 
-def nearest_by_y(target_y: float, items: List[Dict[str, Any]], page: int, y_tol: float = 8.0):
+def nearest_by_y(
+    target_y: float,
+    items: List[Dict[str, Any]],
+    page: int,
+    y_tol: float = 8.0
+):
     """
-    Return the value of the item whose y0 is closest to target_y on the same page within tolerance.
-    Each item is dict with 'y0','value','page'.
+    Find item from items (which include y0/page/value)
+    closest in vertical position to target_y.
     """
     best = None
     best_d = 1e9
@@ -742,117 +445,73 @@ def nearest_by_y(target_y: float, items: List[Dict[str, Any]], page: int, y_tol:
         return best
     return None
 
-def extract_approval_data_from_text_blocks(pdf_bytes: bytes, course_y: float, page: int, y_tolerance: float = 30.0) -> Dict[str, str]:
+def extract_approval_data_from_text_blocks(
+    pdf_bytes: bytes,
+    course_y: float,
+    page: int,
+    y_tolerance: float = 30.0
+) -> Dict[str, str]:
     """
-    Extract approval data from text blocks near a course line.
-    This handles forms where approval data is handwritten rather than in form fields.
+    Heuristic approach for handwritten/ink signatures and UR equivalent
+    that appear as plain text near the course line.
     """
-    approval_data = {"elective": "", "major_minor": "", "comments": "", "ur_equivalent": ""}
-    
-    # Get all text blocks
+    approval_data = {
+        "elective": "",
+        "major_minor": "",
+        "comments": "",
+        "ur_equivalent": ""
+    }
+
     blocks = page_blocks(pdf_bytes)
-    
-    # Find blocks near the course
-    nearby_blocks = []
-    for block in blocks:
-        if block["page"] == page and abs(block["y0"] - course_y) <= y_tolerance:
-            nearby_blocks.append(block)
-    
-    # Debug: Print all nearby blocks to see what we're finding
-    print(f"DEBUG: Course Y={course_y}, Found {len(nearby_blocks)} nearby blocks:")
-    for block in nearby_blocks:
-        print(f"  Y={block['y0']}: '{block['text']}'")
-    
-    # Look for approval-related text patterns
+
+    nearby_blocks = [
+        b for b in blocks
+        if b["page"] == page and abs(b["y0"] - course_y) <= y_tolerance
+    ]
+
     for block in nearby_blocks:
         text = block["text"].strip()
         if not text:
             continue
-            
-        # Debug: Print all text blocks to see what we're finding
-        if "erin" in text.lower() or "smith" in text.lower() or "rohan" in text.lower() or "palma" in text.lower():
-            print(f"DEBUG: Found signature text: '{text}' at Y={block['y0']}")
-            
-        # Check for elective approval patterns (from previous form)
-        # Look for specific patterns that indicate elective approval
-        if any(term in text.lower() for term in ["rohan", "palma", "rp", "general elective", "elective only"]):
+        lower_text = text.lower()
+
+        # elective-ish
+        if any(term in lower_text for term in [
+            "general elective", "elective only", "rohan", "palma", "rp"
+        ]):
             approval_data["elective"] = text
-            
-        # Also check for "Erin Smith" in elective context
-        if "erin smith" in text.lower() and any(term in text.lower() for term in ["elective", "general elective"]):
-            approval_data["elective"] = text
-            
-        # Check for major/minor approval patterns with handwritten signatures
-        # Look for patterns like "INTR: PPD", "INTR: GoN; PaC", or handwritten names
-        # But exclude elective-specific terms
-        if (any(term in text.lower() for term in ["intr:", "major", "minor"]) and 
-            not any(term in text.lower() for term in ["elective", "general elective", "elective only"])):
+
+        # major/minor-ish
+        if (
+            any(term in lower_text for term in ["intr:", "major", "minor"])
+            and not any(term in lower_text for term in ["elective", "general elective", "elective only"])
+        ):
             approval_data["major_minor"] = text
-            
-        # Check for "Erin Smith" signatures - these are typically Major/Minor unless in elective context
-        if "erin smith" in text.lower():
-            # Check if this is in an elective context by looking for nearby text
-            nearby_text = " ".join([block["text"] for block in nearby_blocks if block["text"]])
-            if any(term in nearby_text.lower() for term in ["elective", "general elective", "elective only"]):
-                approval_data["elective"] = text
-            else:
-                # Default to Major/Minor for Erin Smith signatures
-                approval_data["major_minor"] = text
-            
-        # Enhanced signature detection for common names (already handled above for Erin Smith)
-                
-        # Also check for Rohan Palma signatures
-        if any(name in text for name in ["Rohan Palma", "rohan palma", "Rohan", "Palma", "RP"]):
-            # Rohan Palma signatures are typically elective
-            approval_data["elective"] = text
-            
-        # Check for UR Equivalent patterns
-        # Look for course codes like "FIN 224", "FIN 242", "N/A"
-        if any(pattern in text for pattern in ["FIN 224", "FIN 242", "N/A", "FIN", "MTH", "ENG", "HIS", "PHY", "CHEM", "BIO", "PSY", "SOC", "POL", "ECON"]):
-            # Check if it looks like a course code (2-4 letters followed by 2-4 digits)
-            import re
-            course_code_pattern = r'^[A-Z]{2,4}\s+\d{2,4}$'
-            if re.match(course_code_pattern, text.strip()) or text.strip() == "N/A":
-                approval_data["ur_equivalent"] = text.strip()
-        
-        # Check for comments
-        if any(term in text.lower() for term in ["general elective", "elective only", "comment", "not approved", "approved"]):
+
+        # Detect UR equivalent pattern like "FIN 224" / "N/A"
+        # crude pattern: looks like 2-4 letters + number, or "N/A"
+        if (
+            re.match(r"^[A-Z]{2,4}\s+\d{2,4}$", text.strip())
+            or text.strip().upper() == "N/A"
+        ):
+            approval_data["ur_equivalent"] = text.strip()
+
+        # comments
+        if any(term in lower_text for term in [
+            "general elective", "elective only", "not approved", "approved"
+        ]):
             approval_data["comments"] = text
-    
-    # If no signatures found in text blocks, try OCR as fallback for handwritten signatures
-    if not approval_data["elective"] and not approval_data["major_minor"]:
-        print(f"DEBUG: No signatures found in text blocks, trying OCR for course Y={course_y}")
-        try:
-            from pdf2image import convert_from_bytes
-            import pytesseract
-            
-            # Convert PDF page to image
-            images = convert_from_bytes(pdf_bytes, first_page=page+1, last_page=page+1)
-            if images:
-                # Use OCR to extract text from the image
-                ocr_text = pytesseract.image_to_string(images[0])
-                print(f"DEBUG: OCR extracted text: '{ocr_text[:200]}...'")
-                
-                # Look for signatures in OCR text
-                if "erin smith" in ocr_text.lower():
-                    print("DEBUG: Found Erin Smith in OCR text")
-                    approval_data["major_minor"] = "Erin Smith (OCR)"
-                if "rohan palma" in ocr_text.lower():
-                    print("DEBUG: Found Rohan Palma in OCR text")
-                    approval_data["elective"] = "Rohan Palma (OCR)"
-        except Exception as e:
-            print(f"DEBUG: OCR failed: {e}")
-    
+
     return approval_data
 
-# ------------- Header inference (robust to weird field names) -------------
+# ---------------- Header inference ----------------
 def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) -> Dict[str, str]:
-    fd = { (k or "").strip().lower(): norm_space(v) for k,v in (fields or {}).items() }
+    fd = {(k or "").strip().lower(): norm_space(v) for k, v in (fields or {}).items()}
 
     def pick_by_key(keys, avoid=None, value_re=None):
         avoid = avoid or []
         for k, v in fd.items():
-            if not v: 
+            if not v:
                 continue
             if any(key in k for key in keys) and not any(bad in k for bad in avoid):
                 if value_re and not re.search(value_re, v, re.I):
@@ -865,153 +524,241 @@ def infer_header_from_fields(fields: Dict[str, str], pdf_bytes: bytes = None) ->
     if not name:
         for v in fd.values():
             if re.match(r"^[A-Za-z][A-Za-z .'-]+ [A-Za-z][A-Za-z .'-]+$", v):
-                name = v; break
+                name = v
+                break
 
     # Student ID
     student_id = pick_by_key(["student", "id"], value_re=r"^\d{5,10}$")
     if not student_id:
         for v in fd.values():
-            if re.fullmatch(r"\d{5,10}", v):
-                student_id = v; break
+            if re.fullmatch(r"\d{5,10}", v or ""):
+                student_id = v
+                break
 
-    # Class Year
+    # Class year
     class_year = pick_by_key(["class"], value_re=r"^\d{4}$")
     if not class_year:
         for v in fd.values():
-            m = YEAR_RE.search(v)
+            m = YEAR_RE.search(v or "")
             if m and len(v) <= 6:
-                class_year = m.group(0); break
+                class_year = m.group(0)
+                break
 
     # Date
     date_val = pick_by_key(["date"], value_re=DATE_RE.pattern)
     if not date_val:
         for v in fd.values():
-            m = DATE_RE.search(v)
+            m = DATE_RE.search(v or "")
             if m:
-                date_val = m.group(0); break
+                date_val = m.group(0)
+                break
 
     # Program
     program = pick_by_key(
         ["college where", "study abroad", "program", "college"],
-        avoid=["course", "comments", "equiv", "approve", "class", "semester"]
+        avoid=["course", "comments", "equiv", "approve", "class", "semester", "id", "date", "name"]
     )
     if not program:
-        # heuristic value-based guess
         candidates = []
         for k, v in fd.items():
-            if not v: continue
-            if any(bad in k for bad in ["course","comments","equiv","approve","majorminor","class","semester","id","date","name"]):
+            if not v:
                 continue
-            if re.search(r"(university|college|program|institute|ies|ciee|arcadia|barcelona|madrid|london|paris|florence|milan)", v, re.I):
+            if any(bad in k for bad in ["course", "comments", "equiv", "approve", "majorminor", "class", "semester", "id", "date", "name"]):
+                continue
+            if re.search(
+                r"(university|college|program|institute|ies|ciee|arcadia|barcelona|madrid|london|paris|florence|milan|prague)",
+                v,
+                re.I
+            ):
                 candidates.append(v)
         if candidates:
             program = max(candidates, key=len)
-    
-    # If still no program found, try to extract from text blocks
+
+    # last resort: scan visible text for program-ish strings
     if not program:
         try:
-            blocks = page_blocks(pdf_bytes)
-            for block in blocks:
+            for block in page_blocks(pdf_bytes):
                 text = block["text"].strip()
-                # Look for IES Abroad programs
-                if (re.search(r"ies\s+abroad.*milan.*business", text, re.I) or
-                    re.search(r"ies\s+milan.*university.*bocconi", text, re.I) or
-                    re.search(r"university.*bocconi", text, re.I)):
+                if (
+                    re.search(r"(ies abroad|ciee|university|college|program)", text, re.I)
+                    and len(text) > 20
+                    and not re.search(r"course|subject|number|title", text, re.I)
+                ):
                     program = text
                     break
-                # Look for CIEE programs
-                elif re.search(r"ciee.*central.*european.*studies.*prague", text, re.I):
-                    program = text
-                    break
-                # Look for other study abroad programs (but avoid course titles)
-                elif (re.search(r"(ciee|arcadia|dis|cis|api).*", text, re.I) and 
-                      len(text) > 20 and 
-                      not re.search(r"course|subject|number|title", text, re.I)):
-                    program = text
-                    break
-        except:
+        except Exception:
             pass
 
-    # Semester
+    # Semester / Term
     semester = pick_by_key(["semester"], value_re=TERM_RE.pattern)
     if not semester:
         for v in fd.values():
-            if TERM_RE.search(v):
-                semester = v; break
+            if TERM_RE.search(v or ""):
+                semester = v
+                break
 
     return {
-        "Name": name, "StudentID": student_id, "ClassYear": class_year,
-        "Date": date_val, "Program": program, "Semester": semester
+        "Name": name,
+        "StudentID": student_id,
+        "ClassYear": class_year,
+        "Date": date_val,
+        "Program": program,
+        "Semester": semester
     }
 
-# ------------- Row assembly -------------
+# ---------------- Signature detection helpers ----------------
+def detect_visual_signatures_in_pdf(pdf_bytes: bytes, widgets: List[Dict]) -> Dict[str, bool]:
+    """
+    Attempt to detect ink-like marks / annotations in approval boxes.
+    Returns map: {widget_name: bool}
+    """
+    signature_map = {}
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                drawings = page.get_drawings()
+                annotations = list(page.annots()) if page.annots() else []
+
+                for widget in widgets:
+                    widget_name_full = widget.get("name", "")
+                    widget_name = (widget_name_full or "").lower()
+                    if widget["page"] != page_num:
+                        continue
+                    if not (
+                        "elec" in widget_name or
+                        "major" in widget_name or
+                        "minor" in widget_name
+                    ):
+                        continue
+
+                    rect = fitz.Rect(
+                        widget["x0"] - 3, widget["y0"] - 3,
+                        widget["x1"] + 3, widget["y1"] + 3
+                    )
+
+                    has_sig = False
+
+                    # check drawings
+                    for d in drawings:
+                        for item in d.get("items", []):
+                            # item[0] indicates shape type; item[1] may be geometry
+                            if item[0] in [1, 2, 3]:  # line/rect/curve
+                                if len(item) >= 2:
+                                    geom = item[1]
+                                    # rect intersection
+                                    if hasattr(geom, "x0"):
+                                        if rect.intersects(geom):
+                                            has_sig = True
+                                            break
+                                    elif isinstance(geom, (list, tuple)) and len(geom) >= 2:
+                                        x, y = geom[0], geom[1]
+                                        if rect.x0 <= x <= rect.x1 and rect.y0 <= y <= rect.y1:
+                                            has_sig = True
+                                            break
+                        if has_sig:
+                            break
+
+                    # check annotations
+                    if not has_sig:
+                        for annot in annotations:
+                            if annot.rect.intersects(rect):
+                                has_sig = True
+                                break
+
+                    # check text in that area
+                    if not has_sig:
+                        txt_clip = page.get_text("text", clip=rect)
+                        if txt_clip.strip() and len(txt_clip.strip()) > 1:
+                            has_sig = True
+
+                    signature_map[widget_name_full] = has_sig
+
+        return signature_map
+
+    except Exception:
+        # Fallback: all False
+        for w in widgets:
+            signature_map[w.get("name","")] = False
+        return signature_map
+
+# ---------------- Core row assembly ----------------
 def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
     widgets, fields = read_form_widgets(pdf_bytes)
     header = infer_header_from_fields(fields, pdf_bytes)
 
-    # Prepare column widgets by type (keep positions)
-    def pick(label_substr: str):
+    # small helper to gather widget values by suffix index
+    def pick_widgets_containing(substring: str) -> List[Dict[str, Any]]:
         out = []
         for w in widgets:
-            if label_substr.lower() in (w["name"] or "").lower():
+            if substring.lower() in (w["name"] or "").lower():
                 if w["value"]:
-                    out.append({"page": w["page"], "y0": w["y0"], "x0": w["x0"], "value": w["value"]})
+                    out.append({
+                        "page": w["page"],
+                        "y0": w["y0"],
+                        "x0": w["x0"],
+                        "value": w["value"]
+                    })
         return out
 
-    w_elec  = pick("elecapprove")
-    w_mm    = pick("majorminorapproval")
-    w_comm  = pick("comments")
-    w_equiv = pick("equivalent")
-    w_courses_form = pick("course")  # if the template actually has Course1.. fields
+    w_elec   = pick_widgets_containing("elecapprove")
+    w_mm     = pick_widgets_containing("majorminorapproval")
+    w_comm   = pick_widgets_containing("comments")
+    w_equiv  = pick_widgets_containing("equivalent")
+    # w_courses_form is not strictly used, but we keep the logic
+    # to maintain the structure
+    w_courses_form = pick_widgets_containing("course")
 
-    # A) Try form-based courses first
-    rows = []
+    # ---------- PATH A: structured "Course1 / Equivalent1 / ..." fields ----------
+    rows_path_a: List[Dict[str, Any]] = []
     indices = set()
+
     for w in widgets:
-        m = re.search(r"(course|equivalent|elecapprove|majorminorapproval|comments)\s*([0-9]+)$", (w["name"] or ""), re.I)
+        m = re.search(
+            r"(course|equivalent|elecapprove|majorminorapproval|comments)\s*([0-9]+)$",
+            (w["name"] or ""),
+            re.I
+        )
         if m:
             indices.add(int(m.group(2)))
-    # Collect by index if present
+
+    # detect visual signatures once at top (saves work per row)
+    visual_signatures = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
+
     for i in sorted(indices):
-        c = norm_space(fields.get(f"Course{i}", "") or fields.get(f"course{i}", ""))
-        eq = norm_space(fields.get(f"Equivalent{i}", "") or fields.get(f"equivalent{i}", ""))
-        el = norm_space(fields.get(f"ElecApprove{i}", "") or fields.get(f"elecapprove{i}", ""))
-        mm = norm_space(fields.get(f"MajorMinorApproval{i}", "") or fields.get(f"majorminorapproval{i}", ""))
-        cm = norm_space(fields.get(f"Comments{i}", "") or fields.get(f"comments{i}", ""))
-        if any([c, eq, el, mm, cm]):
-            # Parse course code and title
-            course_code, course_title = parse_course_code_and_title(c)
-            # Extract program info
-            program_name, city, country = extract_program_info(header.get("Program", ""))
-            
-            # For form-based approach, use visual signature detection
-            visual_signatures = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
-            
-            # Check if signatures exist in the approval widgets for this course
-            signature_detected = {"elective": False, "major_minor": False}
-            
-            # Check if elective approval widget has a visual signature
-            elec_widget_name = f"ElecApprove{i}"
-            if elec_widget_name in visual_signatures and visual_signatures[elec_widget_name]:
-                signature_detected["elective"] = True
-            
-            # Check if major/minor approval widget has a visual signature
-            mm_widget_name = f"MajorMinorApproval{i}"
-            if mm_widget_name in visual_signatures and visual_signatures[mm_widget_name]:
-                signature_detected["major_minor"] = True
-            
-            # Map approval type using signature detection
-            approval_type = map_approval_type_from_signatures(signature_detected, el, mm, cm)
-            
-            # Debug print
-            print(f"DEBUG FORM: Course {i}")
-            print(f"  ElecApprove{i}: {visual_signatures.get(elec_widget_name, False)}")
-            print(f"  MajorMinorApproval{i}: {visual_signatures.get(mm_widget_name, False)}")
-            print(f"  Signature detected: {signature_detected}")
-            print(f"  Approval type: '{approval_type}'")
-            print("---")
-            
-        rows.append({
+        raw_course = norm_space(fields.get(f"Course{i}", "") or fields.get(f"course{i}", ""))
+        raw_equiv = norm_space(fields.get(f"Equivalent{i}", "") or fields.get(f"equivalent{i}", ""))
+        raw_elec = norm_space(fields.get(f"ElecApprove{i}", "") or fields.get(f"elecapprove{i}", ""))
+        raw_mm = norm_space(fields.get(f"MajorMinorApproval{i}", "") or fields.get(f"majorminorapproval{i}", ""))
+        raw_comments = norm_space(fields.get(f"Comments{i}", "") or fields.get(f"comments{i}", ""))
+
+        # If literally everything is empty, skip
+        if not any([raw_course, raw_equiv, raw_elec, raw_mm, raw_comments]):
+            continue
+
+        course_code, course_title = parse_course_code_and_title(raw_course)
+        ur_equivalent = raw_equiv  # <-- FIX: define so it's always available
+
+        program_name, city, country = extract_program_info(header.get("Program", ""))
+
+        # infer signature presence from visual_signatures for this index:
+        signature_detected = {"elective": False, "major_minor": False}
+        elec_widget_name = f"ElecApprove{i}"
+        mm_widget_name = f"MajorMinorApproval{i}"
+
+        if elec_widget_name in visual_signatures and visual_signatures[elec_widget_name]:
+            signature_detected["elective"] = True
+        if mm_widget_name in visual_signatures and visual_signatures[mm_widget_name]:
+            signature_detected["major_minor"] = True
+
+        approval_type = map_approval_type_from_signatures(
+            signature_detected,
+            raw_elec,
+            raw_mm,
+            raw_comments
+        )
+
+        rows_path_a.append({
             "Program/University": program_name,
             "City": city,
             "Country": country,
@@ -1019,86 +766,70 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
             "Course Title": course_title,
             "UR Equivalent": ur_equivalent,
             "Major/Minor or Elective": approval_type,
-            "UR Credits": "",  # Not available in current form
-            "Foreign Credits": "",  # Not available in current form
-            "Course Page Link": "",  # Not available in current form
-            "Syllabus Link": "",  # Not available in current form
+            "UR Credits": "",          # not captured here yet
+            "Foreign Credits": "",     # not captured here yet
+            "Course Page Link": "",    # not captured here yet
+            "Syllabus Link": "",       # not captured here yet
             "CourseIndex": i,
-            "Original_Course": c,
-            "Elective_Approval": el,
-            "MajorMinor_Approval": mm,
-            "Comments": cm
+            "Original_Course": raw_course,
+            "Elective_Approval": raw_elec,
+            "MajorMinor_Approval": raw_mm,
+            "Comments": raw_comments
         })
 
-    if rows:
-        df = pd.DataFrame(rows).sort_values("CourseIndex")
-        return df, "Form fields", header
+    if rows_path_a:
+        df_a = pd.DataFrame(rows_path_a).sort_values("CourseIndex")
+        return df_a, "Form fields", header
 
-    # B) No form courses → pull from text blocks (handles hyperlinks)
+    # ---------- PATH B: scrape visible text blocks and align by y ----------
     courses_text = extract_courses_by_blocks(pdf_bytes)
-    # For each course line, attach nearest approval/equiv/comment by y position on same page
-    assembled = []
+    assembled_b: List[Dict[str, Any]] = []
+
     for idx, c in enumerate(courses_text, start=1):
+        # for each detected course line, find nearest data widgets
         near_eq  = nearest_by_y(c["y"], w_equiv, c["page"])
         near_el  = nearest_by_y(c["y"], w_elec,  c["page"])
         near_mm  = nearest_by_y(c["y"], w_mm,    c["page"])
         near_cm  = nearest_by_y(c["y"], w_comm,  c["page"])
-        
-        # Parse course code and title
+
+        # parse course info
         course_code, course_title = parse_course_code_and_title(c["Course"])
-        # Extract program info
         program_name, city, country = extract_program_info(header.get("Program", ""))
-        
-        # Try to extract approval data from text blocks (for handwritten forms)
+
+        # try to extract approval info from local block text (handwriting case)
         text_approval_data = extract_approval_data_from_text_blocks(pdf_bytes, c["y"], c["page"])
-        
-        # Detect signatures in approval widgets
-        signature_detected = detect_signature_in_widgets(widgets, c["y"], c["page"])
-        
-        # Also try visual signature detection
-        visual_signatures = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
-        
-        # Use text-based approval data if form fields are empty
-        elective_approval = (near_el or {}).get("value","") or text_approval_data.get("elective", "")
-        major_minor_approval = (near_mm or {}).get("value","") or text_approval_data.get("major_minor", "")
-        comments = (near_cm or {}).get("value","") or text_approval_data.get("comments", "")
-        
-        # Use text-based UR Equivalent if form fields are empty
-        ur_equivalent = (near_eq or {}).get("value","") or text_approval_data.get("ur_equivalent", "")
-        
-        # Enhanced signature detection - if we found signatures in text blocks, use them
-        if text_approval_data.get("elective") or text_approval_data.get("major_minor"):
-            # Override signature detection based on text findings
-            if text_approval_data.get("elective"):
-                signature_detected["elective"] = True
-            if text_approval_data.get("major_minor"):
-                signature_detected["major_minor"] = True
-        
-        # Map approval type using signature detection
+
+        # signature detection near row using widgets
+        sig_detect_local = detect_signature_in_widgets(
+            widgets,
+            c["y"],
+            c["page"]
+        )
+
+        # also factor in visual signatures
+        if text_approval_data.get("elective"):
+            sig_detect_local["elective"] = True
+        if text_approval_data.get("major_minor"):
+            sig_detect_local["major_minor"] = True
+
+        # pick final approval fields
+        elective_approval = (near_el or {}).get("value", "") or text_approval_data.get("elective", "")
+        major_minor_approval = (near_mm or {}).get("value", "") or text_approval_data.get("major_minor", "")
+        comments = (near_cm or {}).get("value", "") or text_approval_data.get("comments", "")
+
+        ur_equivalent = (
+            (near_eq or {}).get("value", "") or
+            text_approval_data.get("ur_equivalent", "")
+        )
+
         approval_type = map_approval_type_from_signatures(
-            signature_detected,
+            sig_detect_local,
             elective_approval,
             major_minor_approval,
             comments
         )
-        
-        # Debug: Store signature detection info
-        signature_debug = {
-            "course_y": c["y"],
-            "signature_detected": signature_detected,
-            "text_approval_data": text_approval_data,
-            "near_el_value": (near_el or {}).get("value",""),
-            "near_mm_value": (near_mm or {}).get("value",""),
-            "final_approval_type": approval_type
-        }
-        
-        # Debug print to see what's happening
-        print(f"DEBUG: Course Y={c['y']:.1f}")
-        print(f"  Text approval data: {text_approval_data}")
-        print(f"  Signature detected: {signature_detected}")
-        print(f"  Approval type: '{approval_type}'")
-        
-        assembled.append({
+
+        assembled_b.append({
             "Program/University": program_name,
             "City": city,
             "Country": country,
@@ -1106,59 +837,64 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
             "Course Title": course_title,
             "UR Equivalent": ur_equivalent,
             "Major/Minor or Elective": approval_type,
-            "UR Credits": "",  # Not available in current form
-            "Foreign Credits": "",  # Not available in current form
-            "Course Page Link": "",  # Not available in current form
-            "Syllabus Link": "",  # Not available in current form
+            "UR Credits": "",
+            "Foreign Credits": "",
+            "Course Page Link": "",
+            "Syllabus Link": "",
             "CourseIndex": idx,
             "Original_Course": c["Course"],
             "Elective_Approval": elective_approval,
             "MajorMinor_Approval": major_minor_approval,
             "Comments": comments,
-            "Debug_Signature_Detected": str(signature_detected),
+            "Debug_Signature_Detected": str(sig_detect_local),
             "Debug_Course_Y": c["y"],
         })
 
-    if assembled:
-        df = pd.DataFrame(assembled)
-        # drop rows with totally empty course (paranoia)
-        df = df[df["Original_Course"].str.strip().ne("")]
-        return df, "Text blocks (y-aligned)", header
+    if assembled_b:
+        df_b = pd.DataFrame(assembled_b)
+        df_b = df_b[df_b["Original_Course"].str.strip().ne("")]
+        return df_b, "Text blocks (y-aligned)", header
 
-    # C) Last resort: OCR → parse courses from OCR text
-    ocr = ocr_text(pdf_bytes, dpi=300)
+    # ---------- PATH C: OCR fallback ----------
+    ocr_txt = ocr_text(pdf_bytes, dpi=300)
     lines = []
-    for l in ocr.splitlines():
+    exclude_patterns = [
+        r"^THE\s+COLLEGE",
+        r"^COURSE\s+APPROVAL",
+        r"^IES\s+Abroad",
+        r"^DEPARTMENT\s+OR\s+OFFICE",
+        r"^STUDENTS\s+Complete",
+        r"^AUTHORIZED\s+APPROVERS",
+        r"^HOW\s+TO\s+TRANSFER",
+        r"^FORM\s*$",
+        r"^APPROVAL\s*$",
+        r"^COLLEGE\s*$",
+        r"^COURSE\s*$"
+    ]
+    for l in ocr_txt.splitlines():
         line_clean = l.strip()
         if COURSE_LINE_RE.match(line_clean):
-            # Check if this line matches any exclusion patterns
-            should_exclude = False
-            exclude_patterns = [
-                r"^THE\s+COLLEGE", r"^COURSE\s+APPROVAL", r"^IES\s+Abroad",
-                r"^DEPARTMENT\s+OR\s+OFFICE", r"^STUDENTS\s+Complete",
-                r"^AUTHORIZED\s+APPROVERS", r"^HOW\s+TO\s+TRANSFER",
-                r"^FORM\s*$", r"^APPROVAL\s*$", r"^COLLEGE\s*$", r"^COURSE\s*$"
-            ]
-            for pattern in exclude_patterns:
-                if re.match(pattern, line_clean, re.I):
-                    should_exclude = True
+            skip = False
+            for patt in exclude_patterns:
+                if re.match(patt, line_clean, re.I):
+                    skip = True
                     break
-            if not should_exclude:
+            if not skip:
                 lines.append(l)
-    
+
     if lines:
-        assembled_ocr = []
+        assembled_c = []
         for i, l in enumerate(lines, start=1):
             course_text = clean_course_text(l)
-            course_code, course_title = parse_course_code_and_title(course_text)
+            code_c, title_c = parse_course_code_and_title(course_text)
             program_name, city, country = extract_program_info(header.get("Program", ""))
-            
-            assembled_ocr.append({
+
+            assembled_c.append({
                 "Program/University": program_name,
                 "City": city,
                 "Country": country,
-                "Course Code": course_code,
-                "Course Title": course_title,
+                "Course Code": code_c,
+                "Course Title": title_c,
                 "UR Equivalent": "",
                 "Major/Minor or Elective": "",
                 "UR Credits": "",
@@ -1171,13 +907,14 @@ def build_rows(pdf_bytes: bytes) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
                 "MajorMinor_Approval": "",
                 "Comments": ""
             })
-        
-        df = pd.DataFrame(assembled_ocr)
-        return df, "OCR (courses only)", header
 
+        df_c = pd.DataFrame(assembled_c)
+        return df_c, "OCR (courses only)", header
+
+    # If literally nothing worked:
     return pd.DataFrame(), "None", header
 
-# ------------- Streamlit UI -------------
+# ---------------- Streamlit UI ----------------
 st.sidebar.header("Upload Options")
 upload_mode = st.sidebar.radio("Choose upload mode:", ["Single File", "Bulk Upload"])
 
@@ -1186,7 +923,6 @@ if upload_mode == "Single File":
     if not upl:
         st.info("Upload a PDF to begin.")
         st.stop()
-    
     pdf_files = [upl]
     file_names = [upl.name]
 else:
@@ -1194,75 +930,78 @@ else:
     if not upl:
         st.info("Upload one or more PDFs to begin.")
         st.stop()
-    
     pdf_files = upl
     file_names = [f.name for f in upl]
 
-# Process files
 all_results = []
 all_headers = []
 
-for i, (pdf_file, file_name) in enumerate(zip(pdf_files, file_names)):
+for pdf_file, file_name in zip(pdf_files, file_names):
     st.write(f"Processing {file_name}...")
     pdf_bytes = pdf_file.read()
-    
+
     with st.spinner(f"Parsing {file_name}..."):
         df, path, header = build_rows(pdf_bytes)
-    
+
     if not df.empty:
-        # Add source file column
-        df['Source File'] = file_name
+        df["Source File"] = file_name
         all_results.append(df)
         all_headers.append(header)
         st.success(f"✓ {file_name}: {len(df)} course(s) extracted via **{path}**")
     else:
         st.warning(f"⚠ {file_name}: No courses detected")
 
-# Combine all results
+# Combine
 if all_results:
     combined_df = pd.concat(all_results, ignore_index=True)
-    st.subheader(f"Combined Results ({len(combined_df)} total courses from {len(all_results)} files)")
+    st.subheader(f"Combined Results ({len(combined_df)} total courses from {len(all_results)} file(s))")
 else:
     combined_df = pd.DataFrame()
     st.error("No courses detected from any files.")
 
-# Display results
+# Display
 if combined_df.empty:
     st.error("No courses detected from any files. Try clearer scans or different files.")
 else:
-    # Create the final output DataFrame with only the desired columns
-    output_columns = [
-        "Source File", "Program/University", "City", "Country", "Course Code", "Course Title",
-        "UR Equivalent", "Major/Minor or Elective", "UR Credits", "Foreign Credits",
-        "Course Page Link", "Syllabus Link"
+    desired_cols = [
+        "Source File",
+        "Program/University",
+        "City",
+        "Country",
+        "Course Code",
+        "Course Title",
+        "UR Equivalent",
+        "Major/Minor or Elective",
+        "UR Credits",
+        "Foreign Credits",
+        "Course Page Link",
+        "Syllabus Link"
     ]
-    
-    # Ensure all columns exist in the DataFrame
-    for col in output_columns:
+
+    # Ensure all columns exist
+    for col in desired_cols:
         if col not in combined_df.columns:
             combined_df[col] = ""
-    
-    # Filter to only include the desired columns
-    final_df = combined_df[output_columns].copy()
-    
-    # Display the data without filter row
+
+    final_df = combined_df[desired_cols].copy()
+
     st.dataframe(final_df, use_container_width=True)
-    
-    # For download, create CSV without filter row
+
     csv_data = final_df.to_csv(index=False)
-    st.download_button("Download Combined Results as CSV", csv_data.encode("utf-8"),
-                       file_name="caf_bulk_results.csv", mime="text/csv")
-    
-    # Show debug info in expander
+    st.download_button(
+        "Download Combined Results as CSV",
+        csv_data.encode("utf-8"),
+        file_name="caf_bulk_results.csv",
+        mime="text/csv"
+    )
+
+    # Debug info
     with st.expander("Debug: Original Data"):
         st.dataframe(combined_df, use_container_width=True)
-    
-    # Show signature detection debug info
-    with st.expander("Debug: Signature Detection"):
-        st.write("This shows which approval widgets have signatures detected:")
+
+    with st.expander("Debug: Signature Detection Details"):
         widgets, fields = read_form_widgets(pdf_bytes)
-        
-        # Show ALL widgets first to see what we're working with
+
         st.write("**All Widgets Found:**")
         all_widgets = []
         for w in widgets:
@@ -1276,50 +1015,58 @@ else:
             st.dataframe(pd.DataFrame(all_widgets), use_container_width=True)
         else:
             st.write("No widgets found at all.")
-        
-        # Now show signature detection
-        st.write("**Signature Detection Results:**")
-        signature_widgets = []
+
+        st.write("**Approval Widgets (text-based signature guess):**")
+        sig_rows = []
         for w in widgets:
             widget_name = (w["name"] or "").lower()
             widget_value = (w["value"] or "").strip()
-            
-            # Check if it's an approval-related widget
-            is_approval_widget = "elec" in widget_name or any(term in widget_name for term in ["major", "minor"])
-            
+            is_approval_widget = (
+                "elec" in widget_name or
+                "major" in widget_name or
+                "minor" in widget_name
+            )
             if is_approval_widget:
-                has_signature = widget_value and widget_value.lower() not in ["", "no", "n", "none", "yes", "y", "approved", "denied"]
-                signature_widgets.append({
+                # if looks like real initials/name (not generic yes/no)
+                has_signature = (
+                    widget_value
+                    and widget_value.lower() not in
+                    ["", "no", "n", "none", "yes", "y", "approved", "denied"]
+                    and len(widget_value.strip()) > 1
+                )
+                sig_rows.append({
                     "Widget Name": w["name"],
                     "Value": widget_value,
                     "Page": w["page"],
                     "Y Position": round(w["y0"], 1),
                     "Type": "Elective" if "elec" in widget_name else "Major/Minor",
-                    "Has Signature": has_signature
+                    "Has Signature (text)": has_signature
                 })
-        
-        if signature_widgets:
-            st.dataframe(pd.DataFrame(signature_widgets), use_container_width=True)
+        if sig_rows:
+            st.dataframe(pd.DataFrame(sig_rows), use_container_width=True)
         else:
             st.write("No approval widgets found.")
-        
-        # Show visual signature detection results
+
         st.write("**Visual Signature Detection Results:**")
-        visual_signatures = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
-        visual_results = []
-        for widget_name, has_signature in visual_signatures.items():
-            if "elec" in widget_name.lower() or "major" in widget_name.lower() or "minor" in widget_name.lower():
-                visual_results.append({
+        vis_map = detect_visual_signatures_in_pdf(pdf_bytes, widgets)
+        vis_rows = []
+        for widget_name, has_sig in vis_map.items():
+            low = widget_name.lower() if widget_name else ""
+            if "elec" in low or "major" in low or "minor" in low:
+                vis_rows.append({
                     "Widget Name": widget_name,
-                    "Has Visual Signature": has_signature
+                    "Has Visual Signature": has_sig
                 })
-        
-        if visual_results:
-            st.dataframe(pd.DataFrame(visual_results), use_container_width=True)
+        if vis_rows:
+            st.dataframe(pd.DataFrame(vis_rows), use_container_width=True)
         else:
             st.write("No visual signatures detected.")
 
 with st.expander("Debug: Header & Raw Form Fields"):
-    st.write("Header inference:", header)
-    widgets, fields = read_form_widgets(pdf_bytes)
-    st.write("Raw field keys (sample):", list(fields.keys())[:50])
+    # NOTE: pdf_bytes will be last processed file's bytes
+    st.write("Header inference:", all_headers[-1] if all_headers else {})
+    if 'pdf_bytes' in locals():
+        widgets, fields = read_form_widgets(pdf_bytes)
+        st.write("Raw field keys (sample):", list(fields.keys())[:50])
+    else:
+        st.write("No file processed.")
